@@ -5,9 +5,30 @@ import dotenv from "dotenv";
 import multer from "multer";
 import XLSX from "xlsx";
 import fs from "fs";
+import { MongoClient } from "mongodb";
 
 dotenv.config();
 const app = express();
+
+// ── MONGODB CONNECTION ────────────────────────────────────────────
+let db = null;
+
+async function connectDB() {
+  if (!process.env.MONGODB_URI) {
+    console.log("⚠ No MONGODB_URI — using in-memory storage only");
+    return;
+  }
+  try {
+    const client = new MongoClient(process.env.MONGODB_URI);
+    await client.connect();
+    db = client.db("kavach");
+    console.log("✅ MongoDB connected — kavach database");
+  } catch(e) {
+    console.error("❌ MongoDB connection failed:", e.message);
+    console.log("⚠ Falling back to in-memory storage");
+  }
+}
+connectDB();
 app.use(cors({
   origin: process.env.FRONTEND_URL || "*",
   methods: ["GET", "POST"],
@@ -18,6 +39,7 @@ const upload = multer({ dest: "uploads/" });
 
 let RFI_DATA = null;
 let SUPPLIER_DATA = null;
+let SUPPLIERS_REGISTRY = {};  // in-memory fallback
 
 // ── PARSERS ──────────────────────────────────────────────────────
 
@@ -82,14 +104,92 @@ app.post("/upload/rfi", upload.single("file"), (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
-app.post("/upload/supplier", upload.single("file"), (req, res) => {
+app.post("/upload/supplier", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file" });
-    SUPPLIER_DATA = parseSupplier(XLSX.readFile(req.file.path));
+    const supplierName = req.body?.supplierName || `Supplier_${Date.now()}`;
+    const parsed = parseSupplier(XLSX.readFile(req.file.path));
     fs.unlinkSync(req.file.path);
-    console.log("Supplier loaded:", SUPPLIER_DATA.variants.map(v => v.name).join(", "));
-    res.json({ variants_found: SUPPLIER_DATA.variants.map(v => v.name) });
+
+    // Set as active supplier in memory
+    SUPPLIER_DATA = parsed;
+    SUPPLIERS_REGISTRY[supplierName] = {
+      data: parsed,
+      variants: parsed.variants.map(v => v.name),
+      uploadedAt: new Date().toISOString()
+    };
+
+    // Save to MongoDB if connected
+    if (db) {
+      try {
+        await db.collection("suppliers").updateOne(
+          { name: supplierName },
+          { $set: {
+              name: supplierName,
+              variants: parsed.variants,
+              variantNames: parsed.variants.map(v => v.name),
+              uploadedAt: new Date()
+          }},
+          { upsert: true }
+        );
+        console.log(`✅ Supplier "${supplierName}" saved to MongoDB`);
+      } catch(e) {
+        console.error("MongoDB save error:", e.message);
+      }
+    }
+
+    console.log(`Supplier "${supplierName}" loaded:`, parsed.variants.map(v => v.name).join(", "));
+    res.json({ variants_found: parsed.variants.map(v => v.name), supplierName });
   } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
+// Get all suppliers — from MongoDB if available, else in-memory
+app.get("/suppliers", async (_, res) => {
+  try {
+    if (db) {
+      const suppliers = await db.collection("suppliers")
+        .find({}, { projection: { name:1, variantNames:1, uploadedAt:1, _id:0 } })
+        .sort({ uploadedAt: -1 })
+        .toArray();
+      return res.json({ suppliers: suppliers.map(s => ({
+        name: s.name,
+        variants: s.variantNames || [],
+        uploadedAt: s.uploadedAt
+      }))});
+    }
+    // Fallback to in-memory
+    const suppliers = Object.entries(SUPPLIERS_REGISTRY).map(([name, s]) => ({
+      name, variants: s.variants, uploadedAt: s.uploadedAt
+    }));
+    res.json({ suppliers });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// OEM selects a supplier — load from MongoDB or memory
+app.post("/select/supplier", async (req, res) => {
+  const { supplierName } = req.body || {};
+  if (!supplierName) return res.status(400).json({ error: "supplierName required" });
+
+  try {
+    // Try MongoDB first
+    if (db) {
+      const sup = await db.collection("suppliers").findOne({ name: supplierName });
+      if (sup) {
+        SUPPLIER_DATA = { variants: sup.variants };
+        console.log(`Active supplier set to: ${supplierName} (from MongoDB)`);
+        return res.json({ ok: true, supplierName, variants: sup.variants.map(v => v.name) });
+      }
+    }
+
+    // Fallback to in-memory registry
+    if (SUPPLIERS_REGISTRY[supplierName]) {
+      SUPPLIER_DATA = SUPPLIERS_REGISTRY[supplierName].data;
+      console.log(`Active supplier set to: ${supplierName} (from memory)`);
+      return res.json({ ok: true, supplierName, variants: SUPPLIER_DATA.variants.map(v => v.name) });
+    }
+
+    return res.status(404).json({ error: "Supplier not found" });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/data/rfi",      (_, res) => res.json(RFI_DATA || {}));
