@@ -656,6 +656,70 @@ app.post("/api/report", async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── SAVE CONVERSATION ────────────────────────────────────────────
+
+app.post("/api/save-conversation", async (req, res) => {
+  try {
+    const { supplierName, sharedMessages, variantChats, variantResults } = req.body;
+    if (!supplierName) return res.status(400).json({ error: "supplierName required" });
+
+    const doc = {
+      supplierName,
+      savedAt: new Date(),
+      sharedMessages: sharedMessages || [],
+      variantChats: variantChats || {},
+      variantResults: variantResults || [],
+      summary: {
+        active: (variantResults||[]).filter(v=>v.status==="active").length,
+        eliminated: (variantResults||[]).filter(v=>v.status==="eliminated").length,
+        total: (variantResults||[]).length
+      }
+    };
+
+    if (db) {
+      await db.collection("conversations").insertOne(doc);
+      console.log(`✅ Conversation saved for ${supplierName}`);
+      res.json({ ok: true, savedAt: doc.savedAt });
+    } else {
+      res.json({ ok: false, reason: "DB not connected" });
+    }
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get all conversations for a supplier
+app.get("/conversations/:supplierName", async (req, res) => {
+  try {
+    const { supplierName } = req.params;
+    if (!db) return res.json({ conversations: [] });
+
+    const convs = await db.collection("conversations")
+      .find({ supplierName }, {
+        projection: { supplierName:1, savedAt:1, variantResults:1, summary:1, _id:1 }
+      })
+      .sort({ savedAt: -1 })
+      .limit(20)
+      .toArray();
+
+    res.json({ conversations: convs.map(c => ({
+      id: c._id.toString(),
+      supplierName: c.supplierName,
+      savedAt: c.savedAt,
+      summary: c.summary,
+      variantResults: c.variantResults
+    }))});
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get full conversation by ID
+app.get("/conversation/:id", async (req, res) => {
+  try {
+    const { ObjectId } = await import("mongodb");
+    const conv = await db.collection("conversations").findOne({ _id: new ObjectId(req.params.id) });
+    if (!conv) return res.status(404).json({ error: "Not found" });
+    res.json(conv);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── HEALTH ────────────────────────────────────────────────────────
 
 app.get("/health", (_, res) => res.json({
