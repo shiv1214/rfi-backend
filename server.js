@@ -720,6 +720,46 @@ app.get("/conversation/:id", async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── FOLLOW-UP CHAT ───────────────────────────────────────────────
+
+app.post("/api/chat", async (req, res) => {
+  try {
+    const { userMessage, convSummary, history } = req.body;
+    if (!userMessage) return res.status(400).json({ error: "userMessage required" });
+
+    const systemPrompt = `You are KAVACH, an AI assistant specialized in analyzing eAxle supplier evaluation results for Tata Motors.
+
+You have access to the following evaluation summary:
+${convSummary || "No evaluation summary provided."}
+
+Your job is to answer questions about this evaluation — why variants passed or failed, what deviations were found, what recommendations were made, and any other analysis the user needs.
+
+Be concise, professional, and specific. Use the evaluation data to give accurate answers.`;
+
+    const messages = [
+      ...(history || []).slice(-10),
+      { role: "user", content: userMessage }
+    ];
+
+    const response = await fetch(`https://api.openai.com/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: process.env.AI_MODEL || "gpt-4o-mini",
+        max_tokens: 500,
+        messages: [{ role: "system", content: systemPrompt }, ...messages]
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || "API error");
+    res.json({ reply: data.choices?.[0]?.message?.content?.trim() || "" });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── HEALTH ────────────────────────────────────────────────────────
 
 app.get("/health", (_, res) => res.json({
